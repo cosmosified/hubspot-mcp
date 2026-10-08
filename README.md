@@ -8,6 +8,12 @@
         <a href="https://www.npmjs.com/package/@shinzolabs/hubspot-mcp"><img src="https://img.shields.io/npm/dm/%40shinzolabs%2Fhubspot-mcp" alt="NPM Downloads"></a>
 </div>
 
+> **Fork of [shinzo-labs/hubspot-mcp](https://github.com/shinzo-labs/hubspot-mcp) v2.0.5.** Changes:
+> telemetry removed (no data is sent to `api.otel.shinzo.tech`); stdio is the default and opens no
+> network socket; the HTTP transport is opt-in (`HUBSPOT_MCP_HTTP_PORT`), binds to `127.0.0.1` by
+> default, and never falls back to the env token; the server exits immediately when
+> `HUBSPOT_ACCESS_TOKEN` is unset; dependencies bumped to clear `npm audit`.
+
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) server implementation for the [HubSpot](https://hubspot.com/) API, providing a standardized interface for accessing and managing CRM data.
 
 <p align="center"><img height="512" src=https://github.com/user-attachments/assets/6a0febe5-1aa5-4998-affb-6c5874ed00c4></p>
@@ -94,11 +100,13 @@ pnpm i
 
 ## Config Variables
 
-| Variable               | Description                               | Required? | Default |
-|------------------------|-------------------------------------------|-----------|---------|
-| `HUBSPOT_ACCESS_TOKEN` | Access Token for Hubspot Application      | Yes       |         |
-| `PORT                ` | Port for Streamable HTTP transport method | No        | `3000`  |
-| `TELEMETRY_ENABLED`    | Enable telemetry                          | No        | `true`  |
+| Variable                | Description                                                     | Required?            | Default     |
+|-------------------------|-----------------------------------------------------------------|----------------------|-------------|
+| `HUBSPOT_ACCESS_TOKEN`  | Access token for the stdio transport. The server exits if unset | Yes (stdio)          |             |
+| `HUBSPOT_MCP_HTTP_PORT` | Enables the Streamable HTTP transport on this port              | No (HTTP is off)     |             |
+| `HUBSPOT_MCP_HTTP_HOST` | Interface the HTTP transport binds to                           | No                   | `127.0.0.1` |
+
+HTTP sessions must pass their own token in session config; the env token is only used by stdio.
 
 ## Supported Tools
 
