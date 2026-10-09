@@ -3,7 +3,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createStatefulServer } from "@smithery/sdk/server/stateful.js"
-import { instrumentServer } from "@shinzolabs/instrumentation-mcp"
 import { z } from "zod"
 
 function formatResponse(data: any) {
@@ -71,30 +70,23 @@ async function handleEndpoint(apiCall: () => Promise<any>) {
   }
 }
 
-function getConfig(config: any) {
+// Telemetry removed: upstream exported traces to https://api.otel.shinzo.tech/v1 unless
+// TELEMETRY_ENABLED=false. This build has no telemetry dependency at all.
+function getConfig(config: any, allowEnvToken: boolean) {
   return {
-    hubspotAccessToken: config?.HUBSPOT_ACCESS_TOKEN || process.env.HUBSPOT_ACCESS_TOKEN,
-    telemetryEnabled: config?.TELEMETRY_ENABLED || process.env.TELEMETRY_ENABLED || "true"
+    hubspotAccessToken: config?.HUBSPOT_ACCESS_TOKEN || (allowEnvToken ? process.env.HUBSPOT_ACCESS_TOKEN : undefined)
   }
 }
 
-function createServer({ config }: { config?: any } = {}) {
+function createServer({ config, allowEnvToken = false }: { config?: any, allowEnvToken?: boolean } = {}) {
   const serverInfo = {
     name: "HubSpot-MCP",
-    version: "2.0.5",
+    version: "2.0.5-enrfin.1",
     description: "An extensive MCP for the HubSpot API"
   }
   const server = new McpServer(serverInfo)
 
-  const { hubspotAccessToken, telemetryEnabled } = getConfig(config)
-
-  if (telemetryEnabled !== "false") {
-    const telemetry = instrumentServer(server, {
-      serverName: serverInfo.name,
-      serverVersion: serverInfo.version,
-      exporterEndpoint: "https://api.otel.shinzo.tech/v1"
-    })
-  }
+  const { hubspotAccessToken } = getConfig(config, allowEnvToken)
 
   // Companies: https://developers.hubspot.com/docs/reference/api/crm/objects/companies
 
@@ -2520,12 +2512,28 @@ function createServer({ config }: { config?: any } = {}) {
   return server.server
 }
 
-// Stdio Server 
-const stdioServer = createServer({})
-const transport = new StdioServerTransport()
-await stdioServer.connect(transport)
+// Stdio server (default). The only transport an MCP client like kiro-cli needs; it opens no
+// network socket. It is the only transport allowed to use HUBSPOT_ACCESS_TOKEN from the env.
+// Fail fast without a token: starting anyway only defers the failure to the first tool call.
+const httpPort = process.env.HUBSPOT_MCP_HTTP_PORT
+if (process.env.HUBSPOT_ACCESS_TOKEN) {
+  const stdioServer = createServer({ allowEnvToken: true })
+  const transport = new StdioServerTransport()
+  await stdioServer.connect(transport)
+} else if (!httpPort) {
+  console.error("hubspot-mcp: HUBSPOT_ACCESS_TOKEN is not set")
+  process.exit(1)
+}
 
-// Streamable HTTP Server
-const { app } = createStatefulServer(createServer)
-const PORT = process.env.PORT || 3000
-app.listen(PORT)
+// Streamable HTTP server: opt-in only. Upstream always listened on *:3000 (all interfaces),
+// unauthenticated, and fell back to the operator's HUBSPOT_ACCESS_TOKEN, so anyone who could
+// reach the port could act on the CRM as that user. The listener also kept the process alive
+// after the MCP client closed stdin (orphaned servers), and a second instance crashed with
+// EADDRINUSE. Now it starts only when HUBSPOT_MCP_HTTP_PORT is set, binds to loopback unless
+// HUBSPOT_MCP_HTTP_HOST says otherwise, and each HTTP session must supply its own token via
+// session config (the env token is never used for HTTP).
+if (httpPort) {
+  const httpHost = process.env.HUBSPOT_MCP_HTTP_HOST || "127.0.0.1"
+  const { app } = createStatefulServer(({ config }: { config?: any }) => createServer({ config }))
+  app.listen(Number(httpPort), httpHost)
+}
