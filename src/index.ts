@@ -2,7 +2,10 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import { createStatefulServer } from "@smithery/sdk/server/stateful.js"
+import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js"
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js"
+import { randomUUID } from "node:crypto"
 import { z } from "zod"
 
 function formatResponse(data: any) {
@@ -81,7 +84,7 @@ function getConfig(config: any, allowEnvToken: boolean) {
 function createServer({ config, allowEnvToken = false }: { config?: any, allowEnvToken?: boolean } = {}) {
   const serverInfo = {
     name: "HubSpot-MCP",
-    version: "2.0.5-enrfin.1",
+    version: "2.0.5-enrfin.2",
     description: "An extensive MCP for the HubSpot API"
   }
   const server = new McpServer(serverInfo)
@@ -333,7 +336,7 @@ function createServer({ config, allowEnvToken = false }: { config?: any, allowEn
     "Create a new CRM object",
     {
       objectType: z.enum(['companies', 'contacts', 'deals', 'tickets', 'products', 'line_items', 'quotes', 'custom']),
-      properties: z.record(z.any()),
+      properties: z.record(z.string(), z.any()),
       associations: z.array(z.object({
         to: z.object({ id: z.string() }),
         types: z.array(z.object({
@@ -358,7 +361,7 @@ function createServer({ config, allowEnvToken = false }: { config?: any, allowEn
     {
       objectType: z.enum(['companies', 'contacts', 'deals', 'tickets', 'products', 'line_items', 'quotes', 'custom']),
       objectId: z.string(),
-      properties: z.record(z.any())
+      properties: z.record(z.string(), z.any())
     },
     async (params) => {
       return handleEndpoint(async () => {
@@ -422,7 +425,7 @@ function createServer({ config, allowEnvToken = false }: { config?: any, allowEn
     {
       objectType: z.enum(['companies', 'contacts', 'deals', 'tickets', 'products', 'line_items', 'quotes', 'custom']),
       inputs: z.array(z.object({
-        properties: z.record(z.any()),
+        properties: z.record(z.string(), z.any()),
         associations: z.array(z.object({
           to: z.object({ id: z.string() }),
           types: z.array(z.object({
@@ -470,7 +473,7 @@ function createServer({ config, allowEnvToken = false }: { config?: any, allowEn
       objectType: z.enum(['companies', 'contacts', 'deals', 'tickets', 'products', 'line_items', 'quotes', 'custom']),
       inputs: z.array(z.object({
         id: z.string(),
-        properties: z.record(z.any())
+        properties: z.record(z.string(), z.any())
       }))
     },
     async (params) => {
@@ -1700,7 +1703,7 @@ function createServer({ config, allowEnvToken = false }: { config?: any, allowEn
         ownerIds: z.array(z.string()).optional(),
         ticketIds: z.array(z.string()).optional()
       }).optional(),
-      metadata: z.record(z.any()).optional()
+      metadata: z.record(z.string(), z.any()).optional()
     },
     async (params) => {
       return handleEndpoint(async () => {
@@ -1719,7 +1722,7 @@ function createServer({ config, allowEnvToken = false }: { config?: any, allowEn
     {
       engagementId: z.string(),
       engagement: engagementDetailsSchema,
-      metadata: z.record(z.any()).optional()
+      metadata: z.record(z.string(), z.any()).optional()
     },
     async (params) => {
       return handleEndpoint(async () => {
@@ -2017,7 +2020,7 @@ function createServer({ config, allowEnvToken = false }: { config?: any, allowEn
     hs_email_status: z.enum(['SENT', 'DRAFT', 'SCHEDULED']).optional(),
     hs_email_direction: z.enum(['INBOUND', 'OUTBOUND']).optional(),
     hs_timestamp: z.string().optional(),
-    hs_email_headers: z.record(z.string()).optional(),
+    hs_email_headers: z.record(z.string(), z.string()).optional(),
     hs_email_from_email: z.string().email(),
     hs_email_from_firstname: z.string().optional(),
     hs_email_from_lastname: z.string().optional(),
@@ -2534,6 +2537,52 @@ if (process.env.HUBSPOT_ACCESS_TOKEN) {
 // session config (the env token is never used for HTTP).
 if (httpPort) {
   const httpHost = process.env.HUBSPOT_MCP_HTTP_HOST || "127.0.0.1"
-  const { app } = createStatefulServer(({ config }: { config?: any }) => createServer({ config }))
+  // @smithery/sdk was dropped (its 1.x line pins zod 3, which has GHSA-mrhx-c7xc-m3w5; 2.x+ no
+  // longer ships a server). This is the same stateful Streamable HTTP endpoint built on the MCP
+  // SDK: one server per session, the session token taken from the initialize request's
+  // ?HUBSPOT_ACCESS_TOKEN= query param as Smithery did, and Host-header (DNS rebinding) checks
+  // on loopback.
+  const app = createMcpExpressApp({ host: httpHost })
+  const sessions = new Map<string, StreamableHTTPServerTransport>()
+  const sessionError = (res: any, status: number, code: number, message: string) =>
+    res.status(status).json({ jsonrpc: "2.0", error: { code, message }, id: null })
+
+  app.post("/mcp", async (req: any, res: any) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined
+    let transport = sessionId ? sessions.get(sessionId) : undefined
+    if (!transport) {
+      if (sessionId || !isInitializeRequest(req.body)) {
+        sessionError(res, 400, -32000, "Session not found or expired")
+        return
+      }
+      const token = req.query?.HUBSPOT_ACCESS_TOKEN
+      const config = typeof token === "string" ? { HUBSPOT_ACCESS_TOKEN: token } : {}
+      const newTransport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: id => { sessions.set(id, newTransport) }
+      })
+      newTransport.onclose = () => { if (newTransport.sessionId) sessions.delete(newTransport.sessionId) }
+      try {
+        await createServer({ config }).connect(newTransport)
+      } catch {
+        sessionError(res, 500, -32603, "Error initializing server.")
+        return
+      }
+      transport = newTransport
+    }
+    await transport.handleRequest(req, res, req.body)
+  })
+
+  const existingSession = async (req: any, res: any) => {
+    const transport = sessions.get(req.headers["mcp-session-id"] as string)
+    if (!transport) {
+      sessionError(res, 400, -32000, "Session not found or expired")
+      return
+    }
+    await transport.handleRequest(req, res)
+  }
+  app.get("/mcp", existingSession)
+  app.delete("/mcp", existingSession)
+
   app.listen(Number(httpPort), httpHost)
 }
